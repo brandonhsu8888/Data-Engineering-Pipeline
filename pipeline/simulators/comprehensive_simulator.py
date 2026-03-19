@@ -5,13 +5,18 @@ Simulates virtual clock advancing through trading dates, calling DataProvider
 and emitting data to landing_zone for ingestion by IngestionEngine.
 
 Design: docs/superpowers/specs/2026-03-20-spx-data-pipeline-design.md
+
+Performance optimizations:
+- Build indexes at init time to avoid repeated file scans
+- Use date-based lookups instead of full scans
+- Batch processing for fundamentals
 """
 
 import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Set
 
 from ..data_provider import SPXDataProvider
 
@@ -35,19 +40,77 @@ class ComprehensiveSimulator:
     Advances through trading dates, calls DataProvider for each date,
     and emits data files to landing_zone when data exists.
 
+    Performance: Builds indexes at init to avoid repeated file scans.
+
     Flow:
-        Virtual Clock Date → DataProvider.get_*() → Landing Zone Files
+        Virtual Clock Date -> DataProvider.get_*() -> Landing Zone Files
     """
 
     def __init__(self, provider: Optional[SPXDataProvider] = None):
         self.provider = provider or SPXDataProvider()
         self._ensure_directories()
 
+        # Performance: Build indexes once at init
+        logger.info("Building transcript index...")
+        self._transcript_index: Dict[str, List[dict]] = {}  # date -> list of transcripts
+        self._build_transcript_index()
+
+        logger.info("Building fundamental index...")
+        self._fundamental_index: Dict[str, List[tuple]] = {}  # date -> [(ticker, report_type, freq), ...]
+        self._build_fundamental_index()
+
     def _ensure_directories(self):
         """Ensure landing zone directories exist."""
         (LANDING_ZONE / "prices").mkdir(parents=True, exist_ok=True)
         (LANDING_ZONE / "fundamentals").mkdir(parents=True, exist_ok=True)
         (LANDING_ZONE / "transcripts").mkdir(parents=True, exist_ok=True)
+
+    def _build_transcript_index(self):
+        """Build date-indexed transcript lookup for fast access."""
+        all_transcripts = self.provider.list_transcripts()
+        for transcript in all_transcripts:
+            date = transcript["date"]
+            if date not in self._transcript_index:
+                self._transcript_index[date] = []
+            self._transcript_index[date].append(transcript)
+
+    def _build_fundamental_index(self):
+        """
+        Build date-indexed fundamental lookup for fast access.
+
+        Scans all fundamental files once and indexes by their first (most recent) date.
+        This avoids reading file headers every day (the known performance bug).
+        """
+        import glob
+        fundamental_dir = DATA_DIR / "data" / "fundamental" / "SPX_Fundamental_History"
+        pattern = str(fundamental_dir / "*.csv")
+
+        for filepath in glob.glob(pattern):
+            filename = Path(filepath).stem  # e.g., "AAPL_income_quarterly"
+            parts = filename.rsplit("_", 2)
+            if len(parts) != 3:
+                continue
+
+            ticker, report_type, freq = parts
+
+            # Read only the first row to get the first date column
+            try:
+                with open(filepath, "r") as f:
+                    first_line = f.readline().strip()
+                    if first_line:
+                        cols = first_line.split(",")
+                        if len(cols) > 1:
+                            fiscal_date = cols[1]  # First date column
+                            if fiscal_date and not fiscal_date.startswith("0"):
+                                if fiscal_date not in self._fundamental_index:
+                                    self._fundamental_index[fiscal_date] = []
+                                self._fundamental_index[fiscal_date].append(
+                                    (ticker, report_type, freq, filepath)
+                                )
+            except Exception:
+                pass
+
+        logger.info(f"Fundamental index built: {len(self._fundamental_index)} dates")
 
     def _read_watermark(self) -> Optional[str]:
         """Read last processed date from watermark file."""
@@ -97,44 +160,28 @@ class ComprehensiveSimulator:
 
     def _emit_fundamentals(self, date: str) -> int:
         """
-        Emit fundamental data for given date.
-        Only emits if fiscal quarter/annual report matches the date.
+        Emit fundamental data for given date using pre-built index.
         Returns number of files emitted.
+
+        Performance: Uses index lookup instead of scanning files each day.
         """
-        # Check for fundamentals on this date (typically quarter end months)
         emitted = 0
-        tickers = self.provider.get_ticker_list()
 
-        # For each ticker, check both annual and quarterly reports
-        for freq in ("annual", "quarterly"):
-            for ticker in tickers[:50]:  # Limit to 50 tickers for performance in backfill
+        # Use pre-built index for fast lookup
+        if date not in self._fundamental_index:
+            return 0
+
+        for ticker, report_type, freq, filepath in self._fundamental_index[date]:
+            output_dir = LANDING_ZONE / "fundamentals" / date
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            output_file = output_dir / f"{ticker}_{report_type}_{freq}.csv"
+            if not output_file.exists():
                 try:
-                    data = self.provider.get_fundamentals(ticker, freq)
-                    if not data:
-                        continue
-
-                    # Check each report type
-                    for report_type, df in data.items():
-                        if df is None or df.empty:
-                            continue
-
-                        # Get the first column date (most recent fiscal period)
-                        cols = df.columns.tolist()
-                        if len(cols) < 2:
-                            continue
-                        fiscal_date = str(cols[1])  # First date column
-
-                        # If fiscal date matches our target date, emit
-                        if fiscal_date == date:
-                            output_dir = LANDING_ZONE / "fundamentals" / date
-                            output_dir.mkdir(parents=True, exist_ok=True)
-
-                            output_file = output_dir / f"{ticker}_{report_type}_{freq}.csv"
-                            if not output_file.exists():
-                                df.to_csv(output_file)
-                                logger.info(f"Emitted fundamental: {output_file}")
-                                emitted += 1
-
+                    import shutil
+                    shutil.copy2(filepath, output_file)
+                    logger.info(f"Emitted fundamental: {output_file}")
+                    emitted += 1
                 except Exception as e:
                     logger.debug(f"Failed to emit fundamentals for {ticker}: {e}")
 
@@ -142,33 +189,30 @@ class ComprehensiveSimulator:
 
     def _emit_transcripts(self, date: str) -> int:
         """
-        Emit transcript PDF for given date if exists.
+        Emit transcript PDF for given date using pre-built index.
         Returns number of transcripts emitted.
-        """
-        output_file = LANDING_ZONE / "transcripts" / f"TICKER_{date}.pdf"
 
-        # For transcripts, we need to check which tickers have earnings on this date
-        # This requires scanning the transcript index
+        Performance: Uses index lookup instead of scanning year-long list.
+        """
         emitted = 0
 
-        try:
-            # Get transcripts for this date across all tickers
-            transcripts = self.provider.list_transcripts(year=int(date[:4]))
+        # Use pre-built index for fast lookup
+        if date not in self._transcript_index:
+            return 0
 
-            for transcript in transcripts:
-                if transcript["date"] == date:
-                    ticker = transcript["ticker"]
-                    src_path = Path(transcript["path"])
-                    dest_file = LANDING_ZONE / "transcripts" / f"{ticker}_{date}.pdf"
+        for transcript in self._transcript_index[date]:
+            ticker = transcript["ticker"]
+            src_path = Path(transcript["path"])
+            dest_file = LANDING_ZONE / "transcripts" / f"{ticker}_{date}.pdf"
 
-                    if not dest_file.exists() and src_path.exists():
-                        import shutil
-                        shutil.copy2(src_path, dest_file)
-                        logger.info(f"Emitted transcript: {dest_file}")
-                        emitted += 1
-
-        except Exception as e:
-            logger.debug(f"Failed to emit transcripts for {date}: {e}")
+            if not dest_file.exists() and src_path.exists():
+                try:
+                    import shutil
+                    shutil.copy2(src_path, dest_file)
+                    logger.info(f"Emitted transcript: {dest_file}")
+                    emitted += 1
+                except Exception as e:
+                    logger.debug(f"Failed to emit transcript for {ticker}: {e}")
 
         return emitted
 

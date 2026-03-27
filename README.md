@@ -133,10 +133,32 @@ python ingestion_engine.py --mode scan
 |-------|------|--------|
 | 1 | DataProvider API | ✅ Completed |
 | 2 | Bronze Layer (Ingestion Engine) | ✅ Completed |
-| 3 | ELT Pipeline (Transform Jobs) | 🔜 Pending |
-| 4 | Silver Layer (Parquet + Sentiment) | 🔜 Pending |
+| 3 | ELT Pipeline (Transform Jobs) | ✅ Completed |
+| 4 | Silver Layer (Parquet + Sentiment) | ✅ Completed (by Phase 3 ELT) |
 | 5 | Gold Layer (OLAP Views) | 🔜 Pending |
 | 6 | Streamlit Dashboard | 🔜 Pending |
+
+### ELT Pipeline (`pipeline/elt_pipeline.py`)
+
+Bronze → Silver transforms:
+
+```bash
+# Run all transforms
+python pipeline/elt_pipeline.py
+
+# Run specific transform
+python pipeline/elt_pipeline.py --resource price
+python pipeline/elt_pipeline.py --resource fundamentals
+python pipeline/elt_pipeline.py --resource transcripts
+python pipeline/elt_pipeline.py --resource sentiment
+```
+
+| Transform | Source | Output |
+|-----------|--------|--------|
+| `price` | raw_price_stream | output/silver/price/date=YYYY-MM-DD/*.parquet |
+| `fundamentals` | raw_fundamental_index | output/silver/fundamentals/ticker=XXX/data.parquet |
+| `transcripts` | raw_transcript_index | output/silver/transcript_text/ticker=XXX/date=YYYY-MM-DD/content.txt |
+| `sentiment` | transcript_text | output/silver/transcript_sentiment/ticker=XXX/date=YYYY-MM-DD/sentiment.parquet |
 
 ## Technology Stack
 

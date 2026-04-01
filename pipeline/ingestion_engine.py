@@ -185,10 +185,10 @@ class IngestionEngine:
             con = self._get_connection()
             con.execute(
                 """
-                INSERT INTO raw_fundamental_index (ticker, report_type, fiscal_date, file_path)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO raw_fundamental_index (ticker, report_type, period, market_date, file_path)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                [ticker, f"{report_type}_{freq}", fiscal_date, str(filepath)],
+                [ticker, report_type, freq, dated_dir, str(filepath)],
             )
 
             self._log_audit("fundamental", ticker, dated_dir, file_hash, "SUCCESS")
@@ -219,10 +219,10 @@ class IngestionEngine:
             con = self._get_connection()
             con.execute(
                 """
-                INSERT INTO raw_transcript_index (ticker, event_date, pdf_path, text_hash)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO raw_transcript_index (ticker, event_date, file_path)
+                VALUES (?, ?, ?)
                 """,
-                [ticker, event_date, str(filepath), file_hash],
+                [ticker, event_date, str(filepath)],
             )
 
             self._log_audit("transcript", ticker, event_date, file_hash, "SUCCESS")

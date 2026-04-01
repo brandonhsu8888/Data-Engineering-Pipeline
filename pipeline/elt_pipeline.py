@@ -190,7 +190,7 @@ class ELTPipeline:
     def transform_fundamentals(self):
         """raw_fundamental_index -> Silver fundamentals Parquet, per ticker.
 
-        1. Deduplicate index (latest received_at per ticker+report_type).
+        1. Deduplicate index (latest ingested_at per ticker+report_type).
         2. Read each source CSV and unpivot to long format.
         3. Write one Parquet file per ticker.
         """
@@ -200,12 +200,12 @@ class ELTPipeline:
             WITH ranked AS (
                 SELECT *,
                        ROW_NUMBER() OVER (
-                           PARTITION BY ticker, report_type
-                           ORDER BY received_at DESC
+                           PARTITION BY ticker, report_type, period
+                           ORDER BY ingested_at DESC
                        ) AS rn
                 FROM raw_fundamental_index
             )
-            SELECT ticker, report_type, fiscal_date, file_path, received_at
+            SELECT ticker, report_type, market_date AS fiscal_date, file_path, ingested_at
             FROM ranked
             WHERE rn = 1
         """).fetchdf()
@@ -225,7 +225,7 @@ class ELTPipeline:
                 )
                 if long_df is not None and not long_df.empty:
                     long_df["source_file_path"] = row["file_path"]
-                    long_df["received_at"] = row["received_at"]
+                    long_df["ingested_at"] = row["ingested_at"]
                     frames.append(long_df)
                     processed += 1
             except Exception as exc:
@@ -243,13 +243,24 @@ class ELTPipeline:
         )
 
         silver_fund_dir = SILVER_DIR / "fundamentals"
-        written = 0
-        for ticker, grp in combined.groupby("ticker"):
-            ticker_dir = silver_fund_dir / f"ticker={ticker}"
-            ticker_dir.mkdir(parents=True, exist_ok=True)
-            grp.to_parquet(ticker_dir / "data.parquet", index=False)
-            written += 1
+        if silver_fund_dir.exists():
+            shutil.rmtree(silver_fund_dir)
+        silver_fund_dir.mkdir(parents=True, exist_ok=True)
 
+        con.register("_combined_fundamentals_df", combined)
+        con.execute("""
+            CREATE OR REPLACE TEMP TABLE _silver_fundamentals_export AS
+            SELECT * FROM _combined_fundamentals_df
+        """)
+        con.execute(f"""
+            COPY _silver_fundamentals_export
+            TO '{silver_fund_dir}'
+            (FORMAT PARQUET, PARTITION_BY (ticker))
+        """)
+        con.unregister("_combined_fundamentals_df")
+        con.execute("DROP TABLE IF EXISTS _silver_fundamentals_export")
+
+        written = combined["ticker"].nunique()
         logger.info(f"Exported fundamentals for {written:,} tickers -> {silver_fund_dir}")
 
     @staticmethod
@@ -300,7 +311,7 @@ class ELTPipeline:
     def transform_transcripts(self):
         """raw_transcript_index -> Silver transcript text files.
 
-        1. Deduplicate index (latest received_at per ticker+event_date).
+        1. Deduplicate index (latest ingested_at per ticker+event_date).
         2. Read each PDF and extract plain text.
         3. Write one .txt file per (ticker, event_date) to transcript_text/.
         """
@@ -311,11 +322,11 @@ class ELTPipeline:
                 SELECT *,
                        ROW_NUMBER() OVER (
                            PARTITION BY ticker, event_date
-                           ORDER BY received_at DESC
+                           ORDER BY ingested_at DESC
                        ) AS rn
                 FROM raw_transcript_index
             )
-            SELECT ticker, event_date, pdf_path, received_at
+            SELECT ticker, event_date, file_path, ingested_at
             FROM ranked
             WHERE rn = 1
         """).fetchdf()
@@ -330,7 +341,7 @@ class ELTPipeline:
 
         for _, row in index_df.iterrows():
             try:
-                text = self._extract_pdf_text(row["pdf_path"])
+                text = self._extract_pdf_text(row["file_path"])
                 if text is None:
                     errors += 1
                     continue
@@ -351,7 +362,7 @@ class ELTPipeline:
                 processed += 1
 
             except Exception as exc:
-                logger.warning(f"Failed to extract transcript {row['pdf_path']}: {exc}")
+                logger.warning(f"Failed to extract transcript {row['file_path']}: {exc}")
                 errors += 1
 
         logger.info(
@@ -410,7 +421,11 @@ class ELTPipeline:
             return
 
         silver_sentiment_dir = SILVER_DIR / "transcript_sentiment"
+        if silver_sentiment_dir.exists():
+            shutil.rmtree(silver_sentiment_dir)
+        silver_sentiment_dir.mkdir(parents=True, exist_ok=True)
         processed = skipped = 0
+        records: list[dict] = []
 
         for ticker_dir in silver_text_dir.iterdir():
             if not ticker_dir.is_dir() or not ticker_dir.name.startswith("ticker="):
@@ -443,18 +458,30 @@ class ELTPipeline:
                     polarity = None
                     subjectivity = None
 
-                # Always write parquet (NULL sentiment if TextBlob failed per spec)
-                sentiment_df = pd.DataFrame([{
+                # Keep NULL sentiment if TextBlob failed per spec.
+                records.append({
                     "ticker": ticker,
                     "event_date": event_date,
                     "sentiment_polarity": polarity,
                     "sentiment_subjectivity": subjectivity,
-                }])
-
-                out_dir = silver_sentiment_dir / f"ticker={ticker}" / f"date={event_date}"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                sentiment_df.to_parquet(out_dir / "sentiment.parquet", index=False)
+                })
                 processed += 1
+
+        if records:
+            con = self._get_connection()
+            sentiment_df = pd.DataFrame(records)
+            con.register("_sentiment_df", sentiment_df)
+            con.execute("""
+                CREATE OR REPLACE TEMP TABLE _silver_sentiment_export AS
+                SELECT * FROM _sentiment_df
+            """)
+            con.execute(f"""
+                COPY _silver_sentiment_export
+                TO '{silver_sentiment_dir}'
+                (FORMAT PARQUET, PARTITION_BY (ticker, event_date))
+            """)
+            con.unregister("_sentiment_df")
+            con.execute("DROP TABLE IF EXISTS _silver_sentiment_export")
 
         logger.info(
             f"Computed sentiment for {processed:,} transcripts ({skipped} skipped)"

@@ -4,6 +4,9 @@ data/fundamental/SPX_Fundamental_History/
 data/transcript/SPX_20yr_PDF_Library_10GB/
 data/reference/tickers.csv
 
+# Gold CSVs for Streamlit Cloud — do NOT ignore
+!data/gold/
+
 # Archive PDFs
 ARCHIVE/SPX_PDF_Library_10GB/
 ARCHIVE/SPX_5yr_PDF_Library_10GB/

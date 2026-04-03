@@ -5,13 +5,18 @@ import sys
 import pandas as pd
 import streamlit as st
 
-# Avoid local `duckdb/` directory shadowing the duckdb package import.
-PROJECT_ROOT = str(Path(__file__).resolve().parent)
-sys.path = [p for p in sys.path if p not in ("", PROJECT_ROOT)]
-duckdb = importlib.import_module("duckdb")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DB_PATH = PROJECT_ROOT / "duckdb" / "spx_analytics.duckdb"
+GOLD_CSV_DIR = PROJECT_ROOT / "data" / "gold"
 
+# CSV mode: used on Streamlit Cloud where DuckDB file is not present
+_USE_CSV = not DB_PATH.exists()
 
-DB_PATH = Path(__file__).resolve().parent / "duckdb" / "spx_analytics.duckdb"
+if not _USE_CSV:
+    # Avoid local `duckdb/` directory shadowing the duckdb package import.
+    sys.path = [p for p in sys.path if p not in ("", str(PROJECT_ROOT))]
+    duckdb = importlib.import_module("duckdb")
+
 EXPECTED_VIEWS = [
     "v_market_daily_summary",
     "v_ticker_profile",
@@ -41,63 +46,46 @@ def check_views(conn) -> tuple[list[str], list[str]]:
 
 @st.cache_data(ttl=300)
 def load_market_daily() -> pd.DataFrame:
-    conn = get_connection()
-    return conn.execute(
-        """
-        SELECT *
-        FROM v_market_daily_summary
-        ORDER BY trade_date
-        """
+    if _USE_CSV:
+        return pd.read_csv(GOLD_CSV_DIR / "market_daily.csv", parse_dates=["trade_date"])
+    return get_connection().execute(
+        "SELECT * FROM v_market_daily_summary ORDER BY trade_date"
     ).df()
 
 
 @st.cache_data(ttl=300)
 def load_ticker_profile() -> pd.DataFrame:
-    conn = get_connection()
-    return conn.execute(
-        """
-        SELECT *
-        FROM v_ticker_profile
-        ORDER BY ticker
-        """
+    if _USE_CSV:
+        return pd.read_csv(GOLD_CSV_DIR / "ticker_profile.csv")
+    return get_connection().execute(
+        "SELECT * FROM v_ticker_profile ORDER BY ticker"
     ).df()
 
 
 @st.cache_data(ttl=300)
 def load_fundamental_snapshot() -> pd.DataFrame:
-    conn = get_connection()
-    return conn.execute(
-        """
-        SELECT *
-        FROM v_fundamental_snapshot
-        ORDER BY ticker
-        """
+    if _USE_CSV:
+        return pd.read_csv(GOLD_CSV_DIR / "fundamental_snapshot.csv")
+    return get_connection().execute(
+        "SELECT * FROM v_fundamental_snapshot ORDER BY ticker"
     ).df()
 
 
 @st.cache_data(ttl=300)
-def load_sentiment_price(
-    ticker: str | None, row_limit: int
-) -> pd.DataFrame:
+def load_sentiment_price(ticker: str | None, row_limit: int) -> pd.DataFrame:
+    if _USE_CSV:
+        df = pd.read_csv(GOLD_CSV_DIR / "sentiment_price.csv", parse_dates=["transcript_date"])
+        if ticker:
+            df = df[df["ticker"] == ticker]
+        return df.sort_values("transcript_date", ascending=False).head(row_limit)
     conn = get_connection()
     if ticker:
         return conn.execute(
-            """
-            SELECT *
-            FROM v_sentiment_price_view
-            WHERE ticker = ?
-            ORDER BY transcript_date DESC
-            LIMIT ?
-            """,
+            "SELECT * FROM v_sentiment_price_view WHERE ticker = ? ORDER BY transcript_date DESC LIMIT ?",
             [ticker, row_limit],
         ).df()
     return conn.execute(
-        """
-        SELECT *
-        FROM v_sentiment_price_view
-        ORDER BY transcript_date DESC
-        LIMIT ?
-        """,
+        "SELECT * FROM v_sentiment_price_view ORDER BY transcript_date DESC LIMIT ?",
         [row_limit],
     ).df()
 
@@ -178,22 +166,22 @@ def render_sentiment_price(sentiment_price: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="SPX Gold Dashboard", layout="wide")
     st.title("SPX 500 Data Pipeline - Phase 6 Dashboard")
-    st.caption("Source: DuckDB Gold Views")
+    st.caption("Source: DuckDB Gold Views" if not _USE_CSV else "Source: CSV (Streamlit Cloud)")
 
-    if not DB_PATH.exists():
-        st.error(f"DuckDB not found: {DB_PATH}")
-        st.stop()
-
-    conn = get_connection()
-    available_views, missing_views = check_views(conn)
-    if missing_views:
-        st.warning(
-            "Missing Gold views: "
-            + ", ".join(missing_views)
-            + ". Run `python gold/build_gold_layer.py` first."
-        )
-    if not available_views:
-        st.stop()
+    if _USE_CSV:
+        # Cloud mode: load directly from CSV files
+        available_views = EXPECTED_VIEWS
+    else:
+        conn = get_connection()
+        available_views, missing_views = check_views(conn)
+        if missing_views:
+            st.warning(
+                "Missing Gold views: "
+                + ", ".join(missing_views)
+                + ". Run `python gold/build_gold_layer.py` first."
+            )
+        if not available_views:
+            st.stop()
 
     ticker_profile = load_ticker_profile() if "v_ticker_profile" in available_views else pd.DataFrame()
     ticker_list = ticker_profile["ticker"].dropna().sort_values().unique().tolist() if not ticker_profile.empty else []
